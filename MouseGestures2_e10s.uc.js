@@ -804,8 +804,9 @@ var ucjsMouseGestures = {
           event.preventDefault();
           event.stopPropagation();
           var gestureStr = this._analyzeGesture();
-          this._showSaveDialog(gestureStr);
           this._recordedPoints = [];
+          this._stopRecordingEvents();
+          this._showSaveDialog(gestureStr);
         } else if (event.button == 2) {
           event.preventDefault();
           event.stopPropagation();
@@ -816,11 +817,23 @@ var ucjsMouseGestures = {
         event.stopPropagation();
         if (this._recordedPoints.length > 2) {
           var gestureStr = this._analyzeGesture();
-          this._showSaveDialog(gestureStr);
           this._recordedPoints = [];
+          this._stopRecordingEvents();
+          this._showSaveDialog(gestureStr);
         }
         break;
     }
+  },
+
+  _stopRecordingEvents: function() {
+    if (!this._isRecording) return;
+    this._isRecording = false;
+    try {
+      window.removeEventListener("mousemove", this, true);
+      window.removeEventListener("mousedown", this, true);
+      window.removeEventListener("mouseup", this, true);
+      window.removeEventListener("contextmenu", this, true);
+    } catch(e) {}
   },
 
   startRecording: function() {
@@ -836,14 +849,15 @@ var ucjsMouseGestures = {
   },
 
   stopRecording: function() {
-    if (!this._isRecording) return;
     this._isRecording = false;
-    window.removeEventListener("mousemove", this, true);
-    window.removeEventListener("mousedown", this, true);
-    window.removeEventListener("mouseup", this, true);
-    window.removeEventListener("contextmenu", this, true);
+    try {
+      window.removeEventListener("mousemove", this, true);
+      window.removeEventListener("mousedown", this, true);
+      window.removeEventListener("mouseup", this, true);
+      window.removeEventListener("contextmenu", this, true);
+    } catch(e) {}
     this._destroyRecordOverlay();
-    this.statusinfo = "";
+    try { this.statusinfo = ""; } catch(e) {}
   },
 
   _createRecordOverlay: function() {
@@ -877,12 +891,20 @@ var ucjsMouseGestures = {
   },
 
   _destroyRecordOverlay: function() {
-    if (this._recordOverlay) {
-      this._recordOverlay.parentNode.removeChild(this._recordOverlay);
-      this._recordOverlay = null;
-      this._recordCanvas = null;
-      this._recordCtx = null;
-    }
+    try {
+      if (this._recordOverlay && this._recordOverlay.parentNode) {
+        this._recordOverlay.parentNode.removeChild(this._recordOverlay);
+      }
+    } catch(e) {}
+    try {
+      var old = document.getElementById("ucjs_gestureRecordOverlay");
+      if (old && old.parentNode) {
+        old.parentNode.removeChild(old);
+      }
+    } catch(e) {}
+    this._recordOverlay = null;
+    this._recordCanvas = null;
+    this._recordCtx = null;
   },
 
   _addRecordPoint: function(x, y) {
@@ -998,6 +1020,7 @@ var ucjsMouseGestures = {
     container.querySelector("#gestureCancel").addEventListener("click", function() {
       panel.hidePopup();
       document.getElementById("mainPopupSet").removeChild(panel);
+      that.stopRecording();
     });
     container.querySelector("#gestureSave").addEventListener("click", function() {
       var name = container.querySelector("#gestureName").value;
@@ -1007,6 +1030,12 @@ var ucjsMouseGestures = {
       }
       panel.hidePopup();
       document.getElementById("mainPopupSet").removeChild(panel);
+      that.stopRecording();
+    });
+    panel.addEventListener("popuphidden", function() {
+      if (document.getElementById("ucjs_gestureSavePanel") == panel) {
+        that.stopRecording();
+      }
     });
   },
 

@@ -539,7 +539,57 @@ if (window.opener && location.href == "chrome://browser/content/downloads/conten
         }
       } catch(e) {}
       this._updateFilterButtons();
+      this._applyFilterRetry(0);
+      this._setupListObserver();
+    },
+
+    _applyFilterRetry: function(attempt) {
       this.applyFilter();
+      if (attempt < 8) {
+        var delay = attempt < 3 ? 200 * (attempt + 1) : 500 * (attempt - 2);
+        setTimeout(function() {
+          this._applyFilterRetry(attempt + 1);
+        }.bind(this), delay);
+      }
+    },
+
+    _setupListObserver: function() {
+      var richListBox = document.getElementById("downloadsRichListBox");
+      if (!richListBox) return;
+      if (this._listObserver) {
+        this._listObserver.disconnect();
+      }
+      this._listObserver = new MutationObserver(function(mutations) {
+        var shouldRefresh = false;
+        for (var i = 0; i < mutations.length; i++) {
+          var m = mutations[i];
+          if (m.type == "childList" && (m.addedNodes.length > 0 || m.removedNodes.length > 0)) {
+            shouldRefresh = true;
+            break;
+          }
+          if (m.type == "attributes") {
+            var attrName = m.attributeName ? m.attributeName.toLowerCase() : "";
+            if (attrName.indexOf("mime") >= 0 || attrName.indexOf("type") >= 0 ||
+                attrName.indexOf("class") >= 0 || attrName.indexOf("value") >= 0) {
+              shouldRefresh = true;
+              break;
+            }
+          }
+        }
+        if (shouldRefresh) {
+          if (this._filterTimer) clearTimeout(this._filterTimer);
+          var self = this;
+          this._filterTimer = setTimeout(function() {
+            self.applyFilter();
+          }, 100);
+        }
+      }.bind(this));
+      this._listObserver.observe(richListBox, { 
+        childList: true, 
+        subtree: true, 
+        attributes: true, 
+        attributeFilter: ["mimetype", "class", "value", "uri", "url", "type", "href"] 
+      });
     },
 
     _updateFilterButtons: function() {
@@ -565,14 +615,35 @@ if (window.opener && location.href == "chrome://browser/content/downloads/conten
       this.applyFilter();
     },
 
-    _getMimeCategory: function(aMimeType) {
-      if (!aMimeType) return "other";
-      aMimeType = aMimeType.toLowerCase();
-      for (var category in this._mimeCategories) {
-        var prefixes = this._mimeCategories[category];
-        for (var i = 0; i < prefixes.length; i++) {
-          if (aMimeType.indexOf(prefixes[i]) == 0) {
-            return category;
+    _fileExtensions: {
+      image: ["jpg", "jpeg", "png", "gif", "bmp", "webp", "svg", "ico", "tif", "tiff", "heic", "heif", "avif", "apng"],
+      video: ["mp4", "avi", "mkv", "mov", "wmv", "flv", "webm", "m4v", "3gp", "ts", "mpg", "mpeg", "vob", "ogv", "rmvb"],
+      document: ["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp", "txt", "rtf", "csv", "md", "epub", "mobi", "chm", "pages", "numbers", "key"],
+      archive: ["zip", "rar", "7z", "tar", "gz", "gzip", "bz2", "bzip2", "xz", "lz", "z", "cab", "iso", "dmg", "pkg", "deb", "rpm", "apk", "jar", "war"]
+    },
+
+    _getMimeCategory: function(aMimeType, aFileName) {
+      if (!aMimeType && !aFileName) return "other";
+      if (aMimeType) {
+        aMimeType = aMimeType.toLowerCase();
+        for (var category in this._mimeCategories) {
+          var prefixes = this._mimeCategories[category];
+          for (var i = 0; i < prefixes.length; i++) {
+            if (aMimeType.indexOf(prefixes[i]) == 0) {
+              return category;
+            }
+          }
+        }
+      }
+      if (aFileName) {
+        var match = aFileName.match(/\.([a-zA-Z0-9]+)$/);
+        if (match) {
+          var ext = match[1].toLowerCase();
+          for (var cat in this._fileExtensions) {
+            var exts = this._fileExtensions[cat];
+            if (exts.indexOf(ext) >= 0) {
+              return cat;
+            }
           }
         }
       }
@@ -583,24 +654,114 @@ if (window.opener && location.href == "chrome://browser/content/downloads/conten
       var richListBox = document.getElementById("downloadsRichListBox");
       if (!richListBox) return;
       var items = richListBox.querySelectorAll("richlistitem.download");
+      var visibleCount = 0;
+
+      var listData = {};
+      try {
+        if (this._list && typeof this._list.getAll == "function") {
+          var downloads = this._list.getAll();
+          for (var di = 0; di < downloads.length; di++) {
+            var d = downloads[di];
+            try {
+              var key = "";
+              if (d.source && d.source.url) {
+                key = d.source.url;
+              } else if (d.target && d.target.path) {
+                key = d.target.path;
+              }
+              if (key) {
+                listData[key] = {
+                  contentType: d.contentType || "",
+                  path: (d.target && d.target.path) ? d.target.path : "",
+                  url: (d.source && d.source.url) ? d.source.url : ""
+                };
+              }
+            } catch(ee) {}
+          }
+        }
+      } catch(e) {}
+
+      var getFromListData = function(aUrlOrPath) {
+        if (!aUrlOrPath) return null;
+        if (listData[aUrlOrPath]) return listData[aUrlOrPath];
+        for (var k in listData) {
+          if (k.indexOf(aUrlOrPath) >= 0 || aUrlOrPath.indexOf(k) >= 0) {
+            return listData[k];
+          }
+        }
+        return null;
+      };
+
       for (var i = 0; i < items.length; i++) {
         var item = items[i];
         var mimeType = "";
+        var fileName = "";
+        var itemUri = "";
         try {
           if (item._shell && item._shell.download) {
             mimeType = item._shell.download.contentType || "";
+            try {
+              var dl = item._shell.download;
+              if (dl.target && dl.target.path) {
+                var path = dl.target.path;
+                fileName = path.replace(/^.*[\\\/]/, '');
+              }
+              if (!mimeType && dl.contentType) {
+                mimeType = dl.contentType;
+              }
+            } catch(ee) {}
           }
         } catch(e) {}
+
         if (!mimeType) {
           var icon = item.querySelector(".downloadTypeIcon");
           if (icon) {
-            mimeType = icon.getAttribute("mimetype") || "";
+            mimeType = icon.getAttribute("mimetype") || icon.getAttribute("mime-type") || "";
           }
         }
-        var category = this._getMimeCategory(mimeType);
+
+        if (!fileName) {
+          var targetEl = item.querySelector(".downloadTarget");
+          if (targetEl) {
+            fileName = targetEl.getAttribute("value") || targetEl.textContent || "";
+          }
+        }
+
+        if (!itemUri) {
+          try {
+            var attrs = item.attributes;
+            for (var j = 0; j < attrs.length; j++) {
+              var attrName = attrs[j].name.toLowerCase();
+              if (attrName == "uri" || attrName == "url" || attrName == "href") {
+                var uri = attrs[j].value;
+                itemUri = uri;
+                if (!fileName) {
+                  var lastSlash = Math.max(uri.lastIndexOf("/"), uri.lastIndexOf("\\"));
+                  if (lastSlash >= 0) {
+                    fileName = decodeURIComponent(uri.substring(lastSlash + 1));
+                  }
+                }
+                break;
+              }
+            }
+          } catch(e2) {}
+        }
+
+        if ((!mimeType || !fileName) && itemUri) {
+          var matched = getFromListData(itemUri);
+          if (matched) {
+            if (!mimeType && matched.contentType) mimeType = matched.contentType;
+            if (!fileName && matched.path) {
+              fileName = matched.path.replace(/^.*[\\\/]/, '');
+            }
+          }
+        }
+
+        var category = this._getMimeCategory(mimeType, fileName);
         if (this._currentFilter == "all" || category == this._currentFilter) {
           item.removeAttribute("hidden");
           item.style.display = "";
+          visibleCount++;
         } else {
           item.setAttribute("hidden", "true");
           item.style.display = "none";
@@ -608,11 +769,15 @@ if (window.opener && location.href == "chrome://browser/content/downloads/conten
       }
       var emptyDesc = document.getElementById("downloadsListEmptyDescription");
       if (emptyDesc) {
-        var visibleCount = richListBox.querySelectorAll("richlistitem.download:not([hidden='true'])").length;
         if (this._currentFilter != "all" && visibleCount == 0) {
           emptyDesc.removeAttribute("hidden");
           emptyDesc.style.display = "";
           emptyDesc.textContent = "No downloads in this category";
+        } else {
+          if (items.length > 0) {
+            emptyDesc.setAttribute("hidden", "true");
+            emptyDesc.style.display = "none";
+          }
         }
       }
     },
