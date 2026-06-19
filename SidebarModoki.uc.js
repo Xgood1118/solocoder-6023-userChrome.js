@@ -214,6 +214,34 @@ var SidebarModoki = {
       {
         list-style-image: url('data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAANklEQVQ4jWP4TyFg+P///38GBgayMHUNwEdjdTrVDcDnTKJdgEsRSV5ACaBRF9DZBQObFygBAMeIxVdCQIJTAAAAAElFTkSuQmCC');
       }
+      #SM_dragIndicator
+      {
+        position: relative;
+        width: 2px;
+        background-color: #0a84ff;
+        z-index: 999999;
+        pointer-events: none;
+      }
+      #SM_dragIndicator::before,
+      #SM_dragIndicator::after
+      {
+        content: "";
+        position: absolute;
+        left: 50%;
+        transform: translateX(-50%);
+        width: 8px;
+        height: 8px;
+        background-color: #0a84ff;
+        border-radius: 50%;
+      }
+      #SM_dragIndicator::before
+      {
+        top: -4px;
+      }
+      #SM_dragIndicator::after
+      {
+        bottom: -4px;
+      }
      `;
 
     style = style.replace(/\s+/g, " ").replace(/\{SM_WIDTH\}/g, this.SM_WIDTH).replace(/\{MARGINHACK\}/g, MARGINHACK);
@@ -330,7 +358,275 @@ var SidebarModoki = {
     window.addEventListener("MozDOMFullscreen:Exited", this,
                             /* useCapture */ true,
                             /* wantsUntrusted */ false);
+
+    setTimeout(function(){this.initDragAndDrop();}.bind(this), 500);
     
+  },
+
+  _dragIndicator: null,
+  _dragTabIndex: -1,
+  _dragData: null,
+
+  initDragAndDrop: function() {
+    this._setupDropTarget();
+    let browsers = ["SM_tab0-browser", "SM_tab1-browser"];
+    browsers.forEach((id) => {
+      let browser = document.getElementById(id);
+      if (browser) {
+        browser.addEventListener("load", (e) => {
+          this._setupDragSource(e.target);
+        }, true);
+      }
+    });
+    let browser0 = document.getElementById("SM_tab0-browser");
+    let browser1 = document.getElementById("SM_tab1-browser");
+    if (browser0 && browser0.contentDocument && browser0.contentDocument.readyState == "complete") {
+      this._setupDragSource(browser0);
+    }
+    if (browser1 && browser1.contentDocument && browser1.contentDocument.readyState == "complete") {
+      this._setupDragSource(browser1);
+    }
+  },
+
+  _setupDragSource: function(aBrowser) {
+    try {
+      let doc = aBrowser.contentDocument;
+      let tree = doc.querySelector("tree") || doc.querySelector("#bookmarks-view") || doc.querySelector("#historyTree");
+      if (!tree) {
+        tree = doc.getElementById("bookmarks-view") || doc.getElementById("historyTree");
+      }
+      if (tree) {
+        tree.addEventListener("dragstart", (e) => {
+          this._onDragStart(e, aBrowser);
+        }, false);
+        tree.setAttribute("draggable", "true");
+      }
+    } catch(e) {
+      Cu.reportError("SidebarModoki _setupDragSource error: " + e);
+    }
+  },
+
+  _onDragStart: function(e, aBrowser) {
+    try {
+      let doc = aBrowser.contentDocument;
+      let url = "";
+      let title = "";
+      let selection = null;
+      let tree = doc.querySelector("tree");
+      if (tree && tree.view) {
+        let row = {};
+        let col = {};
+        let sel = tree.view.selection;
+        if (sel && sel.count > 0) {
+          let rangeCount = sel.getRangeCount();
+          if (rangeCount > 0) {
+            let min = {};
+            let max = {};
+            sel.getRangeAt(0, min, max);
+            let rowIndex = min.value;
+            try {
+              if (tree.view.getCellValue) {
+                url = tree.view.getCellValue(rowIndex, tree.columns.getColumnAt(0));
+              }
+              if (tree.view.getCellText) {
+                title = tree.view.getCellText(rowIndex, tree.columns.getPrimaryColumn());
+              }
+            } catch(ex) {}
+            try {
+              if (tree._placesView && PlacesUtils && PlacesUtils.bookmarks) {
+                let node = tree._placesView.selectedNode;
+                if (node) {
+                  url = node.uri || url;
+                  title = node.title || title;
+                }
+              }
+            } catch(ex) {}
+          }
+        }
+      }
+      if (!url && e.target) {
+        let target = e.target;
+        while (target && target.localName != "treeitem" && target.localName != "richlistitem") {
+          target = target.parentNode;
+        }
+        if (target) {
+          let uri = target.getAttribute("uri") || target.getAttribute("url");
+          let name = target.getAttribute("title") || target.getAttribute("name");
+          if (uri) url = uri;
+          if (name) title = name;
+        }
+      }
+      if (url) {
+        this._dragData = { url: url, title: title };
+        e.dataTransfer.effectAllowed = "copy";
+        e.dataTransfer.setData("text/uri-list", url);
+        e.dataTransfer.setData("text/plain", url);
+        if (title) {
+          e.dataTransfer.setData("text/x-moz-url", url + "\n" + title);
+        }
+        try {
+          let dt = e.dataTransfer;
+          if (dt.setDragImage && e.target) {
+            dt.setDragImage(e.target, 16, 16);
+          }
+        } catch(ex) {}
+      }
+    } catch(e) {
+      Cu.reportError("SidebarModoki _onDragStart error: " + e);
+    }
+  },
+
+  _setupDropTarget: function() {
+    let tabContainer = gBrowser.tabContainer;
+    let tabs = tabContainer && tabContainer.tabs ? tabContainer.tabs : document.getElementById("tabbrowser-tabs");
+    if (!tabs) return;
+    tabs.addEventListener("dragover", (e) => { this._onDragOver(e); }, false);
+    tabs.addEventListener("dragleave", (e) => { this._onDragLeave(e); }, false);
+    tabs.addEventListener("drop", (e) => { this._onDrop(e); }, false);
+    tabs.addEventListener("dragend", (e) => { this._onDragEnd(e); }, false);
+  },
+
+  _onDragOver: function(e) {
+    if (!this._dragData && !this._hasURIData(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    let tabs = gBrowser.tabContainer.tabs;
+    let tab = this._getTabAtEvent(e);
+    let rect = tabs.getBoundingClientRect();
+    if (e.clientX < rect.left || e.clientX > rect.right ||
+        e.clientY < rect.top || e.clientY > rect.bottom) {
+      this._hideDropIndicator();
+      return;
+    }
+    if (tab) {
+      let tabRect = tab.getBoundingClientRect();
+      let isBefore = (e.clientX - tabRect.left) < (tabRect.width / 2);
+      let tabIndex = Array.prototype.indexOf.call(tabs.children, tab);
+      if (isBefore) {
+        this._showDropIndicator(tab, "before");
+        this._dragTabIndex = tabIndex;
+      } else {
+        this._showDropIndicator(tab, "after");
+        this._dragTabIndex = tabIndex + 1;
+      }
+    } else {
+      let lastTab = tabs.lastChild;
+      if (lastTab) {
+        this._showDropIndicator(lastTab, "after");
+        this._dragTabIndex = tabs.children.length;
+      }
+    }
+    e.dataTransfer.dropEffect = "copy";
+  },
+
+  _hasURIData: function(e) {
+    if (!e.dataTransfer) return false;
+    let types = e.dataTransfer.types;
+    if (!types) return false;
+    for (let i = 0; i < types.length; i++) {
+      if (types[i] == "text/uri-list" || types[i] == "text/plain" || types[i] == "text/x-moz-url") {
+        return true;
+      }
+    }
+    return false;
+  },
+
+  _getTabAtEvent: function(e) {
+    let tabs = gBrowser.tabContainer.tabs;
+    let target = e.target;
+    while (target && target.localName != "tab") {
+      if (target == tabs) return null;
+      target = target.parentNode;
+    }
+    return target;
+  },
+
+  _showDropIndicator: function(aTab, aPosition) {
+    if (!this._dragIndicator) {
+      this._dragIndicator = document.createElement("box");
+      this._dragIndicator.id = "SM_dragIndicator";
+      this._dragIndicator.style.position = "fixed";
+      this._dragIndicator.style.display = "none";
+      this._dragIndicator.style.pointerEvents = "none";
+      this._dragIndicator.style.zIndex = "999999";
+      document.documentElement.appendChild(this._dragIndicator);
+    }
+    let tabRect = aTab.getBoundingClientRect();
+    let indicator = this._dragIndicator;
+    indicator.style.display = "block";
+    indicator.style.position = "fixed";
+    indicator.style.width = "2px";
+    indicator.style.height = tabRect.height + "px";
+    indicator.style.backgroundColor = "#0a84ff";
+    if (aPosition == "before") {
+      indicator.style.left = (tabRect.left - 1) + "px";
+    } else {
+      indicator.style.left = (tabRect.right - 1) + "px";
+    }
+    indicator.style.top = tabRect.top + "px";
+  },
+
+  _hideDropIndicator: function() {
+    if (this._dragIndicator) {
+      this._dragIndicator.style.display = "none";
+    }
+    this._dragTabIndex = -1;
+  },
+
+  _onDragLeave: function(e) {
+    let tabs = gBrowser.tabContainer.tabs;
+    let rect = tabs.getBoundingClientRect();
+    if (e.clientX < rect.left || e.clientX > rect.right ||
+        e.clientY < rect.top || e.clientY > rect.bottom) {
+      this._hideDropIndicator();
+    }
+  },
+
+  _onDrop: function(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    this._hideDropIndicator();
+    let url = "";
+    let title = "";
+    if (this._dragData) {
+      url = this._dragData.url;
+      title = this._dragData.title;
+    }
+    if (!url && e.dataTransfer) {
+      try {
+        url = e.dataTransfer.getData("text/uri-list") || e.dataTransfer.getData("text/plain");
+      } catch(ex) {}
+      try {
+        let mozUrl = e.dataTransfer.getData("text/x-moz-url");
+        if (mozUrl) {
+          let parts = mozUrl.split("\n");
+          if (parts.length >= 1) url = parts[0];
+          if (parts.length >= 2) title = parts[1];
+        }
+      } catch(ex) {}
+    }
+    if (url && this._dragTabIndex >= 0) {
+      let tab;
+      try {
+        tab = gBrowser.addTab(url, {
+          relatedToCurrent: true,
+          triggeringPrincipal: Services.scriptSecurityManager.createNullPrincipal({})
+        });
+      } catch(ex) {
+        tab = gBrowser.addTab(url);
+      }
+      if (tab) {
+        gBrowser.moveTabTo(tab, this._dragTabIndex);
+      }
+    }
+    this._dragData = null;
+    this._dragTabIndex = -1;
+  },
+
+  _onDragEnd: function(e) {
+    this._hideDropIndicator();
+    this._dragData = null;
+    this._dragTabIndex = -1;
   },
 
 

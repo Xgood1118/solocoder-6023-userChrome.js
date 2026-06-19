@@ -269,6 +269,27 @@ if (window.opener && location.href == "chrome://browser/content/downloads/conten
          {attr: "oncommand", value: "ucjs_downloadManagerMain.doSearch(this.value);"}
         ]));
 
+      let filterBox = ref.appendChild(this.createElement("hbox", []));
+      filterBox.setAttribute("style", "margin-top: 4px; margin-bottom: 4px;");
+      let filterButtons = [
+        { id: "filter-all", label: "All", filter: "all" },
+        { id: "filter-image", label: "Images", filter: "image" },
+        { id: "filter-video", label: "Videos", filter: "video" },
+        { id: "filter-document", label: "Documents", filter: "document" },
+        { id: "filter-archive", label: "Archives", filter: "archive" },
+        { id: "filter-other", label: "Other", filter: "other" }
+      ];
+      filterButtons.forEach((btn) => {
+        let button = this.createElement("button", [
+          { attr: "id", value: "ucjs_filter_" + btn.filter },
+          { attr: "label", value: btn.label },
+          { attr: "type", value: "radio" },
+          { attr: "group", value: "downloadFilter" },
+          { attr: "oncommand", value: "ucjs_downloadManagerMain.setFilter('" + btn.filter + "');" }
+        ]);
+        filterBox.appendChild(button);
+      });
+
       this.originalTitle = document.title +
                            (PrivateBrowsingUtils.isWindowPrivate(window) ? " - Private Window"
                                                                          : "");
@@ -296,7 +317,15 @@ if (window.opener && location.href == "chrome://browser/content/downloads/conten
         Downloads.getList(Downloads.ALL).then(list => {
           this._list = list;
           return this._list.addView(this);
+        }).then(() => {
+          setTimeout(function() {
+            this._initFilter();
+          }.bind(this), 200);
         }).then(null, Cu.reportError);
+      } else {
+        setTimeout(function() {
+          this._initFilter();
+        }.bind(this), 200);
       }
 
       try {
@@ -466,6 +495,144 @@ if (window.opener && location.href == "chrome://browser/content/downloads/conten
     doSearch: function ucjs_doSearch(filterString) {
       var richListBox = document.getElementById("downloadsRichListBox");
       richListBox._placesView.searchTerm = filterString;
+    },
+
+    FILTER_PREF: "browser.download.manager.filterType",
+    _currentFilter: "all",
+
+    _mimeCategories: {
+      image: ["image/"],
+      video: ["video/"],
+      document: [
+        "application/pdf",
+        "application/msword",
+        "application/vnd.ms-word",
+        "application/vnd.ms-excel",
+        "application/vnd.ms-powerpoint",
+        "application/vnd.openxmlformats-officedocument",
+        "application/vnd.oasis.opendocument",
+        "text/plain",
+        "text/rtf",
+        "application/rtf",
+        "application/x-pdf"
+      ],
+      archive: [
+        "application/zip",
+        "application/x-zip-compressed",
+        "application/x-rar-compressed",
+        "application/x-rar",
+        "application/x-7z-compressed",
+        "application/x-7z",
+        "application/x-tar",
+        "application/x-gzip",
+        "application/gzip",
+        "application/x-bzip2",
+        "application/x-bzip"
+      ]
+    },
+
+    _initFilter: function() {
+      try {
+        var savedFilter = Services.prefs.getCharPref(this.FILTER_PREF);
+        if (savedFilter) {
+          this._currentFilter = savedFilter;
+        }
+      } catch(e) {}
+      this._updateFilterButtons();
+      this.applyFilter();
+    },
+
+    _updateFilterButtons: function() {
+      var filters = ["all", "image", "video", "document", "archive", "other"];
+      filters.forEach(function(filter) {
+        var btn = document.getElementById("ucjs_filter_" + filter);
+        if (btn) {
+          if (filter == this._currentFilter) {
+            btn.setAttribute("checked", "true");
+          } else {
+            btn.removeAttribute("checked");
+          }
+        }
+      }.bind(this));
+    },
+
+    setFilter: function(aFilter) {
+      this._currentFilter = aFilter;
+      try {
+        Services.prefs.setCharPref(this.FILTER_PREF, aFilter);
+      } catch(e) {}
+      this._updateFilterButtons();
+      this.applyFilter();
+    },
+
+    _getMimeCategory: function(aMimeType) {
+      if (!aMimeType) return "other";
+      aMimeType = aMimeType.toLowerCase();
+      for (var category in this._mimeCategories) {
+        var prefixes = this._mimeCategories[category];
+        for (var i = 0; i < prefixes.length; i++) {
+          if (aMimeType.indexOf(prefixes[i]) == 0) {
+            return category;
+          }
+        }
+      }
+      return "other";
+    },
+
+    applyFilter: function() {
+      var richListBox = document.getElementById("downloadsRichListBox");
+      if (!richListBox) return;
+      var items = richListBox.querySelectorAll("richlistitem.download");
+      for (var i = 0; i < items.length; i++) {
+        var item = items[i];
+        var mimeType = "";
+        try {
+          if (item._shell && item._shell.download) {
+            mimeType = item._shell.download.contentType || "";
+          }
+        } catch(e) {}
+        if (!mimeType) {
+          var icon = item.querySelector(".downloadTypeIcon");
+          if (icon) {
+            mimeType = icon.getAttribute("mimetype") || "";
+          }
+        }
+        var category = this._getMimeCategory(mimeType);
+        if (this._currentFilter == "all" || category == this._currentFilter) {
+          item.removeAttribute("hidden");
+          item.style.display = "";
+        } else {
+          item.setAttribute("hidden", "true");
+          item.style.display = "none";
+        }
+      }
+      var emptyDesc = document.getElementById("downloadsListEmptyDescription");
+      if (emptyDesc) {
+        var visibleCount = richListBox.querySelectorAll("richlistitem.download:not([hidden='true'])").length;
+        if (this._currentFilter != "all" && visibleCount == 0) {
+          emptyDesc.removeAttribute("hidden");
+          emptyDesc.style.display = "";
+          emptyDesc.textContent = "No downloads in this category";
+        }
+      }
+    },
+
+    onDownloadAdded: function(aDownload) {
+      setTimeout(function() {
+        this.applyFilter();
+      }.bind(this), 100);
+    },
+
+    onDownloadChanged: function(aDownload) {
+      setTimeout(function() {
+        this.applyFilter();
+      }.bind(this), 100);
+    },
+
+    onDownloadRemoved: function(aDownload) {
+      setTimeout(function() {
+        this.applyFilter();
+      }.bind(this), 100);
     }
   };
   ucjs_downloadManagerMain.init();

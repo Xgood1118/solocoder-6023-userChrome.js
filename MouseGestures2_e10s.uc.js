@@ -372,6 +372,9 @@ var ucjsMouseGestures = {
 
      messageManager.addMessageListener("ucjsMouseGestures_executeInChrome", this);
      window.addEventListener("unload", this, false);
+
+    this._addRecordMenuItem();
+    this._loadCustomGestures();
   },
 
   uninit: function() {
@@ -398,6 +401,14 @@ var ucjsMouseGestures = {
   _isWheelCanceled: false,
   _statusinfotimer :null,
   _laststatusinfo : "",
+
+  _isRecording: false,
+  _recordedPoints: [],
+  _customGestures: [],
+  _gesturesFileName: "mouseGestures.json",
+  _recordOverlay: null,
+  _recordCanvas: null,
+  _recordCtx: null,
 
   hideStatusInfo: function() {
     if(this._statusinfotimer)
@@ -452,6 +463,10 @@ var ucjsMouseGestures = {
   },
 
   handleEvent: function(event) {
+    if (this._isRecording) {
+      this._handleRecordEvent(event);
+      return;
+    }
     switch (event.type) {
       case "mousedown": 
         if (event.button == 2) {
@@ -653,6 +668,369 @@ var ucjsMouseGestures = {
     throw "Unknown Gesture: " + this._directionChain;
 
     this._directionChain = "";
+  },
+
+  _addRecordMenuItem: function() {
+    var toolsMenu = document.getElementById("menu_toolsPopup");
+    if (!toolsMenu) return;
+    var menuitem = document.createElement("menuitem");
+    menuitem.setAttribute("id", "ucjs_recordGesture");
+    menuitem.setAttribute("label", "Record Gesture");
+    menuitem.setAttribute("accesskey", "R");
+    menuitem.setAttribute("oncommand", "ucjsMouseGestures.startRecording();");
+    var insertBefore = document.getElementById("menu_browserConsole") || 
+                        document.getElementById("sanitizeItem") ||
+                        toolsMenu.lastChild;
+    if (insertBefore) {
+      toolsMenu.insertBefore(menuitem, insertBefore);
+    } else {
+      toolsMenu.appendChild(menuitem);
+    }
+  },
+
+  _getGesturesFile: function() {
+    try {
+      var file = Components.classes["@mozilla.org/file/directory_service;1"]
+                           .getService(Components.interfaces.nsIProperties)
+                           .get("ProfD", Components.interfaces.nsIFile);
+      file.append(this._gesturesFileName);
+      return file;
+    } catch(e) {
+      return null;
+    }
+  },
+
+  _loadCustomGestures: function() {
+    try {
+      var file = this._getGesturesFile();
+      if (!file || !file.exists()) return;
+      var fstream = Components.classes["@mozilla.org/network/file-input-stream;1"]
+                              .createInstance(Components.interfaces.nsIFileInputStream);
+      fstream.init(file, -1, 0, 0);
+      var cstream = Components.classes["@mozilla.org/intl/converter-input-stream;1"]
+                              .createInstance(Components.interfaces.nsIConverterInputStream);
+      cstream.init(fstream, "UTF-8", 0, 0);
+      var str = "";
+      var data = {};
+      while (cstream.readString(4096, data) != 0) {
+        str += data.value;
+      }
+      cstream.close();
+      fstream.close();
+      this._customGestures = JSON.parse(str);
+      this._mergeCustomGestures();
+    } catch(e) {
+      Cu.reportError("MouseGestures loadCustomGestures error: " + e);
+      this._customGestures = [];
+    }
+  },
+
+  _mergeCustomGestures: function() {
+    if (!this._customGestures || !this._customGestures.length) return;
+    for (var i = 0; i < this._customGestures.length; i++) {
+      var gesture = this._customGestures[i];
+      var actionFunc = this._getGestureActionFunc(gesture.action);
+      if (actionFunc) {
+        this.commands.push([gesture.gesture, gesture.name, actionFunc]);
+      }
+    }
+  },
+
+  _saveCustomGestures: function() {
+    try {
+      var file = this._getGesturesFile();
+      if (!file) return;
+      var fstream = Components.classes["@mozilla.org/network/file-output-stream;1"]
+                              .createInstance(Components.interfaces.nsIFileOutputStream);
+      fstream.init(file, 0x02 | 0x08 | 0x20, 0644, 0);
+      var cstream = Components.classes["@mozilla.org/intl/converter-output-stream;1"]
+                              .createInstance(Components.interfaces.nsIConverterOutputStream);
+      cstream.init(fstream, "UTF-8", 0, 0);
+      cstream.writeString(JSON.stringify(this._customGestures, null, 2));
+      cstream.close();
+      fstream.close();
+    } catch(e) {
+      Cu.reportError("MouseGestures saveCustomGestures error: " + e);
+    }
+  },
+
+  _gestureActions: [
+    { id: "closeTab", label: "Close Tab", action: function() { document.getElementById("cmd_close").doCommand(); } },
+    { id: "newTab", label: "New Tab", action: function() { document.getElementById("cmd_newNavigatorTab").doCommand(); } },
+    { id: "reload", label: "Reload", action: function() { document.getElementById("Browser:Reload").doCommand(); } },
+    { id: "back", label: "Back", action: function() { document.getElementById("Browser:Back").doCommand(); } },
+    { id: "forward", label: "Forward", action: function() { document.getElementById("Browser:Forward").doCommand(); } },
+    { id: "copyURL", label: "Copy URL", action: function() {
+        var url = gBrowser.currentURI.spec;
+        var clipboard = Components.classes["@mozilla.org/widget/clipboardhelper;1"]
+                                  .getService(Components.interfaces.nsIClipboardHelper);
+        clipboard.copyString(url);
+      }
+    }
+  ],
+
+  _getGestureActionFunc: function(actionId) {
+    for (var i = 0; i < this._gestureActions.length; i++) {
+      if (this._gestureActions[i].id == actionId) {
+        return this._gestureActions[i].action;
+      }
+    }
+    return null;
+  },
+
+  _handleRecordEvent: function(event) {
+    switch (event.type) {
+      case "mousedown":
+        if (event.button == 2) {
+          event.preventDefault();
+          event.stopPropagation();
+          this._recordedPoints = [];
+          this._addRecordPoint(event.clientX, event.clientY);
+        }
+        break;
+      case "mousemove":
+        var isButtonDown = false;
+        try {
+          isButtonDown = (event.buttons & 2) != 0;
+        } catch(e) {
+          isButtonDown = this._isMouseDownR;
+        }
+        if (isButtonDown || this._recordedPoints.length > 0) {
+          this._addRecordPoint(event.clientX, event.clientY);
+        }
+        break;
+      case "mouseup":
+        if (event.button == 2 && this._recordedPoints.length > 2) {
+          event.preventDefault();
+          event.stopPropagation();
+          var gestureStr = this._analyzeGesture();
+          this._showSaveDialog(gestureStr);
+          this._recordedPoints = [];
+        } else if (event.button == 2) {
+          event.preventDefault();
+          event.stopPropagation();
+        }
+        break;
+      case "contextmenu":
+        event.preventDefault();
+        event.stopPropagation();
+        if (this._recordedPoints.length > 2) {
+          var gestureStr = this._analyzeGesture();
+          this._showSaveDialog(gestureStr);
+          this._recordedPoints = [];
+        }
+        break;
+    }
+  },
+
+  startRecording: function() {
+    if (this._isRecording) return;
+    this._isRecording = true;
+    this._recordedPoints = [];
+    this.statusinfo = "Gesture Recording: right-click to save";
+    this._createRecordOverlay();
+    window.addEventListener("mousemove", this, true);
+    window.addEventListener("mousedown", this, true);
+    window.addEventListener("mouseup", this, true);
+    window.addEventListener("contextmenu", this, true);
+  },
+
+  stopRecording: function() {
+    if (!this._isRecording) return;
+    this._isRecording = false;
+    window.removeEventListener("mousemove", this, true);
+    window.removeEventListener("mousedown", this, true);
+    window.removeEventListener("mouseup", this, true);
+    window.removeEventListener("contextmenu", this, true);
+    this._destroyRecordOverlay();
+    this.statusinfo = "";
+  },
+
+  _createRecordOverlay: function() {
+    if (this._recordOverlay) return;
+    var overlay = document.createElement("box");
+    overlay.id = "ucjs_gestureRecordOverlay";
+    overlay.style.position = "fixed";
+    overlay.style.top = "0";
+    overlay.style.left = "0";
+    overlay.style.width = "100%";
+    overlay.style.height = "100%";
+    overlay.style.zIndex = "2147483647";
+    overlay.style.pointerEvents = "none";
+    var canvas = document.createElementNS("http://www.w3.org/1999/xhtml", "canvas");
+    canvas.style.width = "100%";
+    canvas.style.height = "100%";
+    canvas.style.display = "block";
+    overlay.appendChild(canvas);
+    document.documentElement.appendChild(overlay);
+    this._recordOverlay = overlay;
+    this._recordCanvas = canvas;
+    this._recordCtx = canvas.getContext("2d");
+    this._resizeCanvas();
+    window.addEventListener("resize", this._resizeCanvas.bind(this), false);
+  },
+
+  _resizeCanvas: function() {
+    if (!this._recordCanvas) return;
+    this._recordCanvas.width = window.innerWidth;
+    this._recordCanvas.height = window.innerHeight;
+  },
+
+  _destroyRecordOverlay: function() {
+    if (this._recordOverlay) {
+      this._recordOverlay.parentNode.removeChild(this._recordOverlay);
+      this._recordOverlay = null;
+      this._recordCanvas = null;
+      this._recordCtx = null;
+    }
+  },
+
+  _addRecordPoint: function(x, y) {
+    this._recordedPoints.push({ x: x, y: y });
+    this._drawRecordPoint(x, y);
+  },
+
+  _drawRecordPoint: function(x, y) {
+    if (!this._recordCtx) return;
+    var ctx = this._recordCtx;
+    var points = this._recordedPoints;
+    ctx.clearRect(0, 0, this._recordCanvas.width, this._recordCanvas.height);
+    if (points.length < 2) {
+      ctx.beginPath();
+      ctx.arc(x, y, 3, 0, Math.PI * 2);
+      ctx.fillStyle = "#ff0000";
+      ctx.fill();
+      return;
+    }
+    ctx.beginPath();
+    ctx.moveTo(points[0].x, points[0].y);
+    for (var i = 1; i < points.length; i++) {
+      ctx.lineTo(points[i].x, points[i].y);
+    }
+    ctx.strokeStyle = "#ff0000";
+    ctx.lineWidth = 3;
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(points[0].x, points[0].y, 5, 0, Math.PI * 2);
+    ctx.fillStyle = "#00ff00";
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(points[points.length - 1].x, points[points.length - 1].y, 5, 0, Math.PI * 2);
+    ctx.fillStyle = "#0000ff";
+    ctx.fill();
+  },
+
+  _analyzeGesture: function() {
+    var points = this._recordedPoints;
+    if (points.length < 3) return "";
+    var gesture = "";
+    var lastDirection = "";
+    var minDistance = 20;
+    var startX = points[0].x;
+    var startY = points[0].y;
+    for (var i = 1; i < points.length; i++) {
+      var dx = points[i].x - startX;
+      var dy = points[i].y - startY;
+      var distance = Math.sqrt(dx * dx + dy * dy);
+      if (distance < minDistance) continue;
+      var direction;
+      if (Math.abs(dx) > Math.abs(dy)) {
+        direction = dx > 0 ? "R" : "L";
+      } else {
+        direction = dy > 0 ? "D" : "U";
+      }
+      if (direction != lastDirection) {
+        gesture += direction;
+        lastDirection = direction;
+        startX = points[i].x;
+        startY = points[i].y;
+      }
+    }
+    return gesture;
+  },
+
+  _showSaveDialog: function(gestureStr) {
+    var actions = this._gestureActions;
+    var actionOptions = "";
+    for (var i = 0; i < actions.length; i++) {
+      actionOptions += '<option value="' + actions[i].id + '">' + actions[i].label + '</option>';
+    }
+    var dialogHtml = `
+      <div style="padding: 20px; min-width: 300px;">
+        <h3 style="margin-top: 0;">Save Gesture</h3>
+        <div style="margin-bottom: 10px;">
+          <label style="display: block; margin-bottom: 5px;">Gesture Name:</label>
+          <input type="text" id="gestureName" value="` + gestureStr + `" 
+                 style="width: 100%; padding: 4px;" />
+        </div>
+        <div style="margin-bottom: 10px;">
+          <label style="display: block; margin-bottom: 5px;">Recognized Gesture:</label>
+          <div style="font-family: monospace; font-size: 18px; font-weight: bold; 
+                      padding: 8px; background: #f0f0f0; border-radius: 4px;">
+            ` + (gestureStr || "(not recognized)") + `
+          </div>
+        </div>
+        <div style="margin-bottom: 15px;">
+          <label style="display: block; margin-bottom: 5px;">Action:</label>
+          <select id="gestureAction" style="width: 100%; padding: 4px;">
+            ` + actionOptions + `
+          </select>
+        </div>
+        <div style="text-align: right;">
+          <button id="gestureCancel" style="margin-right: 8px;">Cancel</button>
+          <button id="gestureSave" style="font-weight: bold;">Save</button>
+        </div>
+      </div>
+    `;
+    var panel = document.createElement("panel");
+    panel.setAttribute("id", "ucjs_gestureSavePanel");
+    panel.setAttribute("type", "arrow");
+    panel.setAttribute("noautofocus", "true");
+    var container = document.createElement("box");
+    container.setAttribute("style", "background: white; color: black; border-radius: 6px;");
+    container.innerHTML = dialogHtml;
+    panel.appendChild(container);
+    document.getElementById("mainPopupSet").appendChild(panel);
+    panel.openPopupAtScreen(this._lastX, this._lastY, false);
+    var that = this;
+    container.querySelector("#gestureCancel").addEventListener("click", function() {
+      panel.hidePopup();
+      document.getElementById("mainPopupSet").removeChild(panel);
+    });
+    container.querySelector("#gestureSave").addEventListener("click", function() {
+      var name = container.querySelector("#gestureName").value;
+      var action = container.querySelector("#gestureAction").value;
+      if (gestureStr && action) {
+        that._saveGesture(gestureStr, name, action);
+      }
+      panel.hidePopup();
+      document.getElementById("mainPopupSet").removeChild(panel);
+    });
+  },
+
+  _saveGesture: function(gesture, name, actionId) {
+    for (var i = 0; i < this._customGestures.length; i++) {
+      if (this._customGestures[i].gesture == gesture) {
+        this._customGestures[i].name = name;
+        this._customGestures[i].action = actionId;
+        this._saveCustomGestures();
+        this.statusinfo = "Gesture updated: " + name;
+        return;
+      }
+    }
+    this._customGestures.push({
+      gesture: gesture,
+      name: name,
+      action: actionId
+    });
+    this._saveCustomGestures();
+    var actionFunc = this._getGestureActionFunc(actionId);
+    if (actionFunc) {
+      this.commands.push([gesture, name, actionFunc]);
+    }
+    this.statusinfo = "Gesture saved: " + name;
   }
 
 };
